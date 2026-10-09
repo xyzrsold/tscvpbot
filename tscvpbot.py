@@ -564,11 +564,11 @@ async def on_callback(cb: CallbackQuery):
         if free:
             slot = free[0]
             set_manual_time(pid, slot)
-            await safe_edit(cb, f"🤖 Поставил на ближайшее свободное время: пост выйдет в {slot:%H:%M}.")
+            await safe_edit(cb, f"Поставил на ближайшее свободное время: пост выйдет в {slot:%H:%M}.")
             await cb.answer(f"Выйдет в {slot:%H:%M}")
         else:
             set_overflow(pid, shift)
-            await safe_edit(cb, f"🤖 Свободных мест на ночь не осталось: пост уйдёт пачкой в {OVERFLOW_TIME:%H:%M}.")
+            await safe_edit(cb, f"Свободных мест на ночь не осталось: пост уйдёт пачкой в {OVERFLOW_TIME:%H:%M}.")
             await cb.answer(f"Выйдет в {OVERFLOW_TIME:%H:%M}")
         return
     elif action == "pick":
