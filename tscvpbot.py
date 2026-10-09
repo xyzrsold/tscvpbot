@@ -45,7 +45,7 @@ from aiogram.types import (
 #  НАСТРОЙКИ - ЗАПОЛНИТЕ ЭТИ 5 СТРОК (текст внутри кавычек)
 # =====================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")        # токен от @BotFather
-GROUP_ID = int(os.getenv("GROUP_ID", "-1002695598511"))                             # ID группы впшеров (узнать командой /id)
+GROUP_ID = int(os.getenv("GROUP_ID", "-1004484271989"))                             # ID группы впшеров (узнать командой /id)
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@testvptsc")        # @username канала или число вида -100...
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 # ADMIN_IDS - ваши ID (и старших модераторов) через запятую. Админы могут менять/отменять любые посты.
@@ -61,6 +61,8 @@ SHIFT_BORDER = dtime(9, 51)          # граница смен: с 09:51 нач�
 STEP = timedelta(minutes=5)          # интервал между постами
 TICK_SECONDS = 10                    # как часто бот проверяет, не пора ли публиковать
 MISSED_GRACE_MIN = 10                # если бот проспал время поста дольше 10 мин - пост переставится на ближайшее свободное
+OVERFLOW_TIME = dtime(9, 55)         # если слоты кончились (140 шт.), остаток уходит пачкой в это время
+OVERFLOW_GRACE = timedelta(minutes=60)  # сколько после OVERFLOW_TIME бот ещё дожимает пачку, потом смена закрывается
 DB_FILE = "vp_bot.db"                # файл с базой (создастся сам)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -127,6 +129,8 @@ def init_db():
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(posts)")}
     if "text_key" not in cols:
         conn.execute("ALTER TABLE posts ADD COLUMN text_key TEXT")  # отпечаток текста поста (антидубль)
+    if "fwd" not in cols:
+        conn.execute("ALTER TABLE posts ADD COLUMN fwd INTEGER DEFAULT 0")  # 1 = в посте есть премиум-эмодзи, пересылаем
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_dedupe ON posts (shift, text_key)")
     conn.commit()
 
@@ -225,29 +229,54 @@ def free_slots(shift, now, exclude_post=None):
     return result
 
 
+def overflow_dt(shift):
+    """Время, когда уходит пачка постов, которым не хватило слотов (09:55 следующих суток)."""
+    return datetime.combine(shift + timedelta(days=1), OVERFLOW_TIME, tzinfo=MSK)
+
+
+def set_overflow(pid, shift):
+    """Поставить пост в пачку на 09:55 (manual=0, чтобы он мог переехать в слот, если тот освободится)."""
+    run("UPDATE posts SET scheduled_at=?, manual=0 WHERE id=?", (int(overflow_dt(shift).timestamp()), pid))
+
+
+def is_overflow(post, shift):
+    return post["scheduled_at"] == int(overflow_dt(shift).timestamp())
+
+
+def when_text(post, shift):
+    """Фраза про время выхода поста."""
+    if is_overflow(post, shift):
+        return f"в {OVERFLOW_TIME:%H:%M} (свободные места на ночь закончились, уйдёт пачкой вместе с остальными)"
+    return f"в {fmt_ts(post['scheduled_at'])}"
+
+
 def plan_shift(shift, now):
     """
     ВАЖНАЯ ФУНКЦИЯ: автоматическая расстановка времени.
     Берёт посты смены без времени (в порядке поступления) и ставит каждому
     ближайшее свободное время с шагом 5 минут. Если мест не хватило - пост
-    помечается как 'не успел' (expired).
-    Возвращает (расставленные, не поместившиеся).
+    уходит в пачку на 09:55 (OVERFLOW_TIME), вместе с остальными такими же.
+    Если слот освободился (например, отменили пост) - посты из пачки возвращаются в очередь.
+    Возвращает (расставленные, ушедшие в пачку).
     """
-    placed, unplaced = [], []
+    placed, overflow = [], []
+    free = free_slots(shift, now)
+    if free:  # есть место - пачку на 09:55 разбираем заново, по порядку поступления
+        run("UPDATE posts SET scheduled_at=NULL WHERE shift=? AND status='pending' "
+            "AND manual=0 AND scheduled_at=?", (shift.isoformat(), int(overflow_dt(shift).timestamp())))
     rows = q(
         "SELECT * FROM posts WHERE shift=? AND status='pending' AND scheduled_at IS NULL ORDER BY id",
         (shift.isoformat(),),
     )
-    free = free_slots(shift, now)
     for r in rows:
         if free:
             slot = free.pop(0)
             run("UPDATE posts SET scheduled_at=? WHERE id=?", (int(slot.timestamp()), r["id"]))
             placed.append((r, slot))
         else:
-            run("UPDATE posts SET status='expired' WHERE id=?", (r["id"],))
-            unplaced.append(r)
-    return placed, unplaced
+            set_overflow(r["id"], shift)
+            overflow.append(r)
+    return placed, overflow
 
 
 def reschedule_missed(shift, now):
@@ -297,6 +326,12 @@ def find_duplicate(shift_str, text_key, pid):
     return rows[0] if rows else None
 
 
+def has_custom_emoji(message):
+    """Есть ли в сообщении премиум (кастомные) эмодзи."""
+    ents = list(message.entities or []) + list(message.caption_entities or [])
+    return any(e.type == "custom_emoji" for e in ents)
+
+
 def register_message(message, shift_str, text_key=None):
     """
     ВАЖНАЯ ФУНКЦИЯ: записать сообщение впшера как пост.
@@ -304,17 +339,20 @@ def register_message(message, shift_str, text_key=None):
     Возвращает (id поста, это новый пост?).
     """
     mg = message.media_group_id
+    fwd = 1 if has_custom_emoji(message) else 0
     if mg:
         rows = q("SELECT id FROM posts WHERE chat_id=? AND media_group_id=?", (message.chat.id, str(mg)))
         if rows:
             run("INSERT OR IGNORE INTO post_messages (post_id, message_id) VALUES (?, ?)",
                 (rows[0]["id"], message.message_id))
+            if fwd:
+                run("UPDATE posts SET fwd=1 WHERE id=?", (rows[0]["id"],))
             return rows[0]["id"], False
     cur = run(
-        "INSERT INTO posts (shift, chat_id, author_id, author_name, media_group_id, created_at, text_key) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO posts (shift, chat_id, author_id, author_name, media_group_id, created_at, text_key, fwd) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (shift_str, message.chat.id, message.from_user.id, message.from_user.full_name,
-         str(mg) if mg else None, int(now_msk().timestamp()), text_key),
+         str(mg) if mg else None, int(now_msk().timestamp()), text_key, fwd),
     )
     pid = cur.lastrowid
     run("INSERT INTO post_messages (post_id, message_id) VALUES (?, ?)", (pid, message.message_id))
@@ -375,16 +413,14 @@ def minutes_kb(pid, slots):
 #  КОМАНДЫ
 # =====================================================================
 HELP_TEXT = (
-    "Как это работает:\n"
-    "1) Отправьте пост в эту группу.\n"
-    "2) До 22:15 МСК бот просто собирает посты. Время можно выбрать кнопкой "
-    "или ответом на свой пост, например: 23:40. Если ничего не выбрать - бот поставит время сам.\n"
+    "Как работает бот:\n"
+    "1) Отправьте пост в рабочую группу.\n"
+    "2) До 22:15 МСК бот просто собирает посты. Время можно выбрать кнопкой или ответом на свой пост, например: 23:40. Если ничего не выбрать - бот поставит ближайшее свободное время сам.\n"
     "3) С 22:15 до 09:50 бот публикует посты в канал с интервалом 5 минут.\n"
     "4) Пост, отправленный ночью, тоже уйдёт в эту же ночь (если успеет до 09:50).\n\n"
     "Команды:\n"
     "/queue - расписание текущей смены\n"
     "/cancel - ответьте этой командой на пост, чтобы отменить его\n"
-    "/id - показать ID чата"
 )
 
 
@@ -483,7 +519,8 @@ async def on_time_reply(message: Message):
 
     slot = next((s for s in free_slots(shift, now, exclude_post=post["id"]) if s >= want), None)
     if slot is None:
-        await message.reply("На это время и позже свободных мест нет.")
+        set_overflow(post["id"], shift)
+        await message.reply(f"На это время и позже свободных мест нет. Пост уйдёт пачкой в {OVERFLOW_TIME:%H:%M}.")
         return
     set_manual_time(post["id"], slot)
     if slot == want:
@@ -523,7 +560,17 @@ async def on_callback(cb: CallbackQuery):
     free = free_slots(shift, now, exclude_post=pid)
 
     if action == "auto":
-        await safe_edit(cb, "🤖 Ок, время поставит бот.")
+        # ближайшее свободное время; если мест нет - пачка на 09:55
+        if free:
+            slot = free[0]
+            set_manual_time(pid, slot)
+            await safe_edit(cb, f"🤖 Поставил на ближайшее свободное время: пост выйдет в {slot:%H:%M}.")
+            await cb.answer(f"Выйдет в {slot:%H:%M}")
+        else:
+            set_overflow(pid, shift)
+            await safe_edit(cb, f"🤖 Свободных мест на ночь не осталось: пост уйдёт пачкой в {OVERFLOW_TIME:%H:%M}.")
+            await cb.answer(f"Выйдет в {OVERFLOW_TIME:%H:%M}")
+        return
     elif action == "pick":
         if not free:
             await safe_edit(cb, "Свободных мест нет.")
@@ -762,6 +809,7 @@ async def on_post(message: Message):
     ВАЖНАЯ ФУНКЦИЯ: любое сообщение впшера в группе считается постом.
     - До 22:15: бот предлагает выбрать время.
     - В рабочее время (22:15-09:50): сразу ставит ближайшее свободное время.
+    - Если места кончились: пост уходит пачкой в 09:55.
     - Если рабочее окно смены уже закрыто: сообщает, что пост не уйдёт.
     - Если на этой смене уже есть пост с таким же текстом: отклоняет его (никуда не планируется).
     """
@@ -792,17 +840,14 @@ async def on_post(message: Message):
         sent = await message.reply(
             f"✅ Пост принят ({shift_title(shift)}).\n"
             "Хотите выбрать время сами? Нажмите кнопку или ответьте на пост временем, например: 23:40.\n"
-            "Если не выберете - бот сам поставит время (22:15-09:50, шаг 5 минут).",
+            "Если не выберете - бот сам поставит ближайшее свободное время (22:15-09:50, шаг 5 минут).",
             reply_markup=prompt_kb(pid),
         )
         run("UPDATE posts SET prompt_msg_id=? WHERE id=?", (sent.message_id, pid))
     elif state == "active":
         plan_shift(shift, now)
         post = get_post(pid)
-        if post["status"] == "expired":
-            await message.reply("⛔ На эту ночь свободных мест не осталось, пост не будет опубликован.")
-        else:
-            await message.reply(f"✅ Пост принят, выйдет в {fmt_ts(post['scheduled_at'])}.")
+        await message.reply(f"✅ Пост принят, выйдет {when_text(post, shift)}.")
     else:
         run("UPDATE posts SET status='expired' WHERE id=?", (pid,))
         await message.reply("⛔ Рабочее окно этой смены уже закрыто, пост не будет опубликован.")
@@ -837,12 +882,13 @@ async def send_long(bot, chat_id, text):
 async def send_post(bot, post):
     """
     ВАЖНАЯ ФУНКЦИЯ: публикация поста в канал.
-    Пост копируется из группы в канал (без пометки "переслано").
+    Пост пересылается (forward) из группы в канал.
     Берётся актуальный текст сообщения - если автор успел отредактировать пост, уйдёт исправленный.
     """
     mids = sorted(r["message_id"] for r in q("SELECT message_id FROM post_messages WHERE post_id=?", (post["id"],)))
     try:
-        result = await bot.copy_messages(chat_id=CHANNEL, from_chat_id=post["chat_id"], message_ids=mids)
+        # всегда пересылка (forward): оформление, в том числе премиум-эмодзи, остаётся как в оригинале
+        result = await bot.forward_messages(chat_id=CHANNEL, from_chat_id=post["chat_id"], message_ids=mids)
     except TelegramRetryAfter as e:
         logging.warning("Telegram просит подождать %s сек", e.retry_after)
         await asyncio.sleep(e.retry_after)
@@ -875,18 +921,19 @@ async def send_due(bot, shift, now):
         await asyncio.sleep(1)
 
 
-async def announce_schedule(bot, shift, unplaced):
+async def announce_schedule(bot, shift, overflow):
     """Сообщение в группу в начале рабочего времени: расписание смены."""
     rows = q("SELECT * FROM posts WHERE shift=? AND status='pending' ORDER BY scheduled_at, id",
              (shift.isoformat(),))
-    if not rows and not unplaced:
+    if not rows:
         return
     lines = [f"🚀 Рабочее время началось ({shift_title(shift)}). Расписание:"]
     for r in rows:
         if r["scheduled_at"]:
             lines.append(f"{fmt_ts(r['scheduled_at'])} - {r['author_name']}")
-    if unplaced:
-        lines.append("\n⚠️ Не хватило мест, не будут опубликованы: " + ", ".join(r["author_name"] for r in unplaced))
+    if overflow:
+        lines.append(f"\n⚠️ Не хватило мест, эти посты уйдут пачкой в {OVERFLOW_TIME:%H:%M}: "
+                     + ", ".join(r["author_name"] for r in overflow))
     await send_long(bot, GROUP_ID, "\n".join(lines))
 
 
@@ -955,14 +1002,22 @@ async def tick(bot):
         if state == "before":
             continue
         if state == "closed":
-            await close_shift(bot, shift)
+            # окно закончилось, но пачка на 09:55 ещё может ждать отправки
+            if now <= overflow_dt(shift) + OVERFLOW_GRACE:
+                plan_shift(shift, now)  # нераспределённые посты (если такие остались) - тоже в пачку
+                await send_due(bot, shift, now)
+                left = q("SELECT COUNT(*) AS c FROM posts WHERE shift=? AND status='pending'", (shift.isoformat(),))
+                if left[0]["c"] == 0:
+                    await close_shift(bot, shift)
+            else:
+                await close_shift(bot, shift)
             continue
         # рабочее время идёт
         reschedule_missed(shift, now)
-        placed, unplaced = plan_shift(shift, now)
+        placed, overflow = plan_shift(shift, now)
         if not s["started"]:
             run("UPDATE shifts SET started=1 WHERE shift=?", (s["shift"],))
-            await announce_schedule(bot, shift, unplaced)
+            await announce_schedule(bot, shift, overflow)
         await send_due(bot, shift, now)
 
 
