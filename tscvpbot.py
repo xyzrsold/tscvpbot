@@ -564,7 +564,7 @@ async def on_callback(cb: CallbackQuery):
         if free:
             slot = free[0]
             set_manual_time(pid, slot)
-            await safe_edit(cb, f"Поставил на ближайшее свободное время: пост выйдет в {slot:%H:%M}.")
+            await safe_edit(cb, f"✅ Поставил на ближайшее свободное время: пост выйдет в {slot:%H:%M}.")
             await cb.answer(f"Выйдет в {slot:%H:%M}")
         else:
             set_overflow(pid, shift)
